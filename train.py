@@ -19,7 +19,6 @@ from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
-from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -28,7 +27,59 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+from compute_scene_metrics import scene_metrics
+
+def score_func(view, gaussians, pipeline, background, scores):
+
+    img_scores = torch.zeros_like(scores)
+    img_scores.requires_grad = True
+
+    image = render(view, gaussians, pipeline, background,
+                   scores=img_scores)['render']
+
+    # Backward computes and stores grad squared values
+    # in img_scores's grad
+    image.sum().backward()
+
+    scores += img_scores.grad
+
+
+def prune(scene, gaussians, pipe, background, prune_ratio):
+
+    iter_start = torch.cuda.Event(enable_timing = True)
+    iter_end = torch.cuda.Event(enable_timing = True)
+    torch.cuda.reset_peak_memory_stats()
+
+    iter_start.record()
+
+    with torch.enable_grad():
+        pbar = tqdm(
+            total=len(scene.getTrainCameras()),
+            desc='Computing Pruning Scores')
+        scores = torch.zeros_like(gaussians.get_opacity)
+        for view in scene.getTrainCameras():
+            score_func(view, gaussians, pipe, background,
+                scores)
+            pbar.update(1)
+        pbar.close()
+
+    gaussians.prune_gaussians(prune_ratio, scores)
+
+    iter_end.record()
+
+    # Track peak memory usage (in bytes) and convert to MB
+    peak_memory_allocated = torch.cuda.max_memory_allocated() / (1024 ** 2)
+    peak_memory_reserved = torch.cuda.max_memory_reserved() / (1024 ** 2)
+    time_ms = iter_start.elapsed_time(iter_end)
+    time_min = time_ms / 60_000
+
+    return {
+        "peak_memory_allocated" : peak_memory_allocated,
+        "peak_memory_reserved" : peak_memory_reserved,
+        "time_min" : time_min
+    }
+
+def training(dataset, opt, pipe, testing_iterations, visualize_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -41,14 +92,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    train_time_ms = 0
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
+
+    prune_time_min = 0
+    prune_peak_memory_allocated = 0
+    prune_peak_memory_reserved = 0
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -63,7 +119,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     break
             except Exception as e:
                 network_gui.conn = None
-
+        torch.cuda.reset_peak_memory_stats()
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
@@ -90,8 +146,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss.backward()
 
         iter_end.record()
+        # Track peak memory usage (in bytes) and convert to MB
+        peak_memory_allocated = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        peak_memory_reserved = torch.cuda.max_memory_reserved() / (1024 ** 2)
+
 
         with torch.no_grad():
+
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
@@ -100,8 +161,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -115,7 +174,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                
+
+                # --- Soft Pruning ---
+                if (iteration >= opt.prune_from_iter) and \
+                    (iteration < opt.prune_until_iter) and \
+                    (iteration % opt.prune_interval == 0):
+
+                    prune_pkg = prune(
+                        scene, gaussians, pipe, background,
+                        opt.densify_prune_ratio)
+                    prune_time_min += prune_pkg['time_min']
+                    prune_peak_memory_allocated = prune_pkg['peak_memory_allocated']
+                    prune_peak_memory_reserved = prune_pkg['peak_memory_reserved']
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
@@ -128,14 +199,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-def prepare_output_and_logger(args):    
+            # --- Hard Pruning ---
+            if (iteration >= opt.densify_until_iter) and \
+                (iteration >= opt.prune_from_iter) and \
+                (iteration < opt.prune_until_iter) and \
+                (iteration % opt.prune_interval == 0):
+
+                prune_pkg = prune(
+                    scene, gaussians, pipe, background,
+                    opt.after_densify_prune_ratio)
+                prune_time_min += prune_pkg['time_min']
+                prune_peak_memory_allocated = prune_pkg['peak_memory_allocated']
+                prune_peak_memory_reserved = prune_pkg['peak_memory_reserved']
+
+
+            # Log and save
+            iter_time = iter_start.elapsed_time(iter_end)
+            train_time_ms += iter_time
+            train_time_min = train_time_ms / 60_000
+
+            training_report(
+                tb_writer, iteration, Ll1, loss,
+                iter_time, train_time_min, prune_time_min,
+                testing_iterations, visualize_iterations,
+                peak_memory_allocated, peak_memory_reserved,
+                prune_peak_memory_allocated, prune_peak_memory_reserved,
+                scene, render,
+                (pipe, background))
+
+
+def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
-        
+
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
@@ -150,42 +250,87 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(
+        tb_writer, iteration, Ll1, loss,
+        iter_time, train_time, prune_time,
+        testing_iterations, visualize_iterations,
+        peak_memory_allocated, peak_memory_reserved,
+        prune_peak_memory_allocated, prune_peak_memory_reserved,
+        scene : Scene, renderFunc, renderArgs):
+
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar('iter_time', elapsed, iteration)
+        tb_writer.add_scalar('time/iter_time', iter_time, iteration)
+        tb_writer.add_scalar('time/train_time_minutes', train_time, iteration)
+        tb_writer.add_scalar('time/prune_time_minutes', prune_time, iteration)
+        tb_writer.add_scalar('counts/total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        tb_writer.add_scalar('memory/peak_allocated_MB', peak_memory_allocated, iteration)
+        tb_writer.add_scalar('memory/peak_reserved_MB', peak_memory_reserved, iteration)
+        if prune_peak_memory_allocated > 0:
+            tb_writer.add_scalar('memory/prune_peak_allocated_MB', prune_peak_memory_allocated, iteration)
+        if prune_peak_memory_reserved > 0:
+            tb_writer.add_scalar('memory/prune_peak_reserved_MB', prune_peak_memory_reserved, iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        print("\n[ITER {}] Training Time: {} minutes".format(
+            iteration, train_time))
+
+        validation_configs = (
+            {'name': 'test', 'cameras' : scene.getTestCameras()},
+            {'name': 'train', 'cameras' : [
+                scene.getTrainCameras()[idx % len(scene.getTrainCameras())]
+                for idx in range(5, 30, 5)] }
+        )
 
         for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
-                psnr_test = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+            name, cameras = config['name'], config['cameras']
+            if cameras and len(cameras) > 0:
+                metrics = scene_metrics(iteration, name, cameras,
+                    scene, renderFunc, renderArgs)
                 if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(
+                        f'metrics_{name}/L1 Loss', metrics[0], iteration)
+                    tb_writer.add_scalar(
+                        f'metrics_{name}/PSNR', metrics[1], iteration)
+                    tb_writer.add_scalar(
+                        f'metrics_{name}/SSIM', metrics[2], iteration)
+                    tb_writer.add_scalar(
+                        f'metrics_{name}/LPIPS', metrics[3], iteration)
+                    tb_writer.add_scalar(
+                        f'metrics_{name}/FPS', metrics[4], iteration)
 
-        if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+    if (iteration in visualize_iterations) and tb_writer:
+        validation_configs = (
+            {'name': 'test', 'cameras' : scene.getTestCameras()},
+            {'name': 'train', 'cameras' : [
+                scene.getTrainCameras()[idx % len(scene.getTrainCameras())]
+                for idx in range(5, 30, 5)] }
+        )
+        for config in validation_configs:
+            for viewpoint in config['cameras'][:5]:
+                image = torch.clamp(
+                    renderFunc(
+                        viewpoint, scene.gaussians, *renderArgs
+                    )["render"],
+                    0.0, 1.0)
+                gt_image = torch.clamp(
+                    viewpoint.original_image.to("cuda"),
+                    0.0, 1.0)
+
+                tb_writer.add_images(
+                    config['name'] + "_view_{}/render".format(
+                        viewpoint.image_name),
+                    image[None], global_step=iteration)
+                tb_writer.add_images(
+                    config['name'] + "_view_{}/ground_truth".format(
+                        viewpoint.image_name),
+                    gt_image[None], global_step=iteration)
+
         torch.cuda.empty_cache()
+
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -197,8 +342,9 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 15_000, 30_000])
+    parser.add_argument("--visualize_iterations", nargs="+", type=int, default=[7_000, 15_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
@@ -213,7 +359,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.visualize_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
     # All done
     print("\nTraining complete.")

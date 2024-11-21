@@ -86,6 +86,14 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
+
+        # pruning parameters
+        self.prune_from_iter = 6000
+        self.prune_until_iter = 30_000
+        self.prune_interval = 3000
+        self.densify_prune_ratio = 0.80
+        self.after_densify_prune_ratio = 0.30
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
