@@ -1,8 +1,8 @@
 # Speedy-Splat: Fast 3D Gaussian Splatting with Sparse Pixels and Sparse Primitives
 
-Alex Hanson, Allen Tu, Geng Lin, Vasu Singla, Matthias Zwicker, Tom Goldstein
+[Alex Hanson](https://www.cs.umd.edu/~hanson/), [Allen Tu](https://tuallen.github.io), [Geng Lin](https://www.cs.umd.edu/people/geng), [Vasu Singla](https://vasusingla.github.io/), [Matthias Zwicker](https://www.cs.umd.edu/~zwicker/), [Tom Goldstein](https://www.cs.umd.edu/~tomg/)
 
-[arXiv]() [website](https://speedysplat.github.io)
+[arXiv]() | [Website](https://speedysplat.github.io)
 
 <img src="assets/speedy_splat_cover.png" alt="Speedy Splat Cover" />
 
@@ -12,7 +12,7 @@ This is the official code repository for the paper "Speedy-Splat: Fast 3D Gaussi
 **Abstract:** *3D Gaussian Splatting (3D-GS) is a recent 3D scene reconstruction technique that enables real-time rendering of novel views by modeling scenes as parametric point clouds of differentiable 3D Gaussians.  However, its rendering speed and model size still present bottlenecks, especially in resource-constrained settings.  In this paper, we identify and address two key inefficiencies in 3D-GS, achieving substantial improvements in rendering speed, model size, and training time.  First, we optimize the rendering pipeline to precisely localize Gaussians in the scene, boosting rendering speed without altering visual fidelity.  Second, we introduce a novel pruning technique and integrate it into the training pipeline, significantly reducing model size and training time while further raising rendering speed.  Our \acronym{} approach combines these techniques to accelerate average rendering speed by a drastic 6.71x across scenes from the Mip-NeRF 360, Tanks \& Temples, and Deep Blending datasets  with 10.6x fewer primitives than 3D-GS.*
 
 ## Setup
-Follow the setup instructions for the original [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting) codebase. Our code changes are made in the differential renderer submodule as well as the python files in this repo.
+Follow the setup instructions for the original [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting) codebase. Our code changes are made in (1) the differential renderer submodule and (2) the Python files in this repo.
 
 ## Running
 
@@ -40,11 +40,11 @@ bash compute_scene_metrics.sh
 
 * `SCENE_MODEL_PATH` is the path to the pretrained 3D-GS model.
 
-* `ONLY_RAW_KERNEL_TIMES` is a boolean (`true`|`false`) variable that when true returns only raw kernel time per image.
+* `ONLY_RAW_KERNEL_TIMES` is a boolean (`true`|`false`) variable. When true, the kernel only returns raw kernel time per image.
 
 This script returns all metrics reported in Speedy-Splat for a pretrained model located in `SCENE_MODEL_PATH` with corresponding data in `SCENE_DATA_PATH`. The metrics will be written to a CSV file located in `SCENE_MODEL_PATH/<train|test>/ours_<iteration>/metrics.csv`, where `train`|`test` is the corresponding dataset split and `iteration` is the model checkpoint iteration.
 
-If `ONLY_RAW_KERNEL_TIMES` is set to `true` the script will instead generate a `kernel_times.csv` file in the same directory as `metrics.csv` with each row in the CSV corresponding to the raw kernel time recorded in milliseconds to render the corresponding image. Currently, this script renders and records each image in the dataset sequentially, then repeats this 20 times.
+If `ONLY_RAW_KERNEL_TIMES` is set to `true`. then the script will generate a `kernel_times.csv` file instead in the same directory as `metrics.csv`. Each row in the CSV records the raw kernel time to render the corresponding image in milliseconds. Currently, this script sequentially renders and records each image in the dataset, then repeats this process 20 times.
 
 ## Results
 <img src="assets/speedy_splat_comparison.png" alt="Speedy Splat Comparison"/>
