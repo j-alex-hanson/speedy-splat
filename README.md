@@ -2,7 +2,7 @@
 
 [Alex Hanson](https://www.cs.umd.edu/~hanson/), [Allen Tu](https://tuallen.github.io), [Geng Lin](https://www.cs.umd.edu/people/geng), [Vasu Singla](https://vasusingla.github.io/), [Matthias Zwicker](https://www.cs.umd.edu/~zwicker/), [Tom Goldstein](https://www.cs.umd.edu/~tomg/)
 
-[arXiv]() | [Website](https://speedysplat.github.io)
+[arXiv](https://arxiv.org/abs/2412.00578) | [Website](https://speedysplat.github.io)
 
 <img src="assets/speedy_splat_cover.png" alt="Speedy Splat Cover" />
 
