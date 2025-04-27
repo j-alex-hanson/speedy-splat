@@ -163,7 +163,8 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
             xyz, rgb, _ = read_points3D_binary(bin_path)
         except:
             xyz, rgb, _ = read_points3D_text(txt_path)
-        assert xyz and rgb, f"Error loading {path} data. Point data must exist in either points3D.bin or points3D.txt"
+        if (xyz.shape[0] == 0) and (rgb.shape[0] == 0):
+            raise ValueError(f"Error loading {path} data. Point data must exist in either points3D.bin or points3D.txt")
         storePly(ply_path, xyz, rgb)
     try:
         pcd = fetchPly(ply_path)
