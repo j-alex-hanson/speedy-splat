@@ -28,6 +28,8 @@ bash train.sh
 
 This script follows the 3D-GS pipeline to train a scene on the data provided by `SCENE_DATA_PATH` and saves the model in the `SCENE_MODEL_PATH` directory. Tensorboard logging has been updated to include all metrics reported in the Speedy-Splat manuscript.
 
+Note: This setup trains at a higher image resolution than the original 3D-GS `full_eval.py` protocol, resulting in larger models and a more demanding evaluation setting.
+
 ### Scene Metrics
 
 To compute scene metrics for an already trained model, set the environment variables `SCENE_DATA_PATH`,`SCENE_MODEL_PATH`, and `ONLY_RAW_KERNEL_TIMES` then run:
